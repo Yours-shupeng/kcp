@@ -655,7 +655,6 @@ static void ikcp_parse_una(ikcpcb *kcp, IUINT32 una)
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = next) {
 		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node);
 		next = p->next;
-		// 为什么不是>=？
 		if (_itimediff(una, seg->sn) > 0) {
 			iqueue_del(p);
 			ikcp_segment_delete(kcp, seg);
