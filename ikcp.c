@@ -982,6 +982,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 				kcp->cwnd++;
 				kcp->incr += mss;
 			}	else {
+			    // incr最小为mss
 				if (kcp->incr < mss) kcp->incr = mss;
 				kcp->incr += (mss * mss) / kcp->incr + (mss / 16);
 				if ((kcp->cwnd + 1) * mss <= kcp->incr) {
@@ -1005,6 +1006,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 
 //---------------------------------------------------------------------
 // ikcp_encode_seg
+// 分片数据编码
 //---------------------------------------------------------------------
 static char *ikcp_encode_seg(char *ptr, const IKCPSEG *seg)
 {
@@ -1019,6 +1021,12 @@ static char *ikcp_encode_seg(char *ptr, const IKCPSEG *seg)
 	return ptr;
 }
 
+/**
+ * 接收窗口剩余大小
+ *
+ * @param kcp
+ * @return
+ */
 static int ikcp_wnd_unused(const ikcpcb *kcp)
 {
 	if (kcp->nrcv_que < kcp->rcv_wnd) {
@@ -1050,13 +1058,14 @@ void ikcp_flush(ikcpcb *kcp)
 	seg.conv = kcp->conv;
 	seg.cmd = IKCP_CMD_ACK;
 	seg.frg = 0;
-	seg.wnd = ikcp_wnd_unused(kcp);
+	seg.wnd = ikcp_wnd_unused(kcp);         // wnd为未使用窗口大小
 	seg.una = kcp->rcv_nxt;
 	seg.len = 0;
 	seg.sn = 0;
 	seg.ts = 0;
 
 	// flush acknowledges
+	// 回复acklist中接收到的所有分片
 	count = kcp->ackcount;
 	for (i = 0; i < count; i++) {
 		size = (int)(ptr - buffer);
@@ -1068,6 +1077,7 @@ void ikcp_flush(ikcpcb *kcp)
 		ptr = ikcp_encode_seg(ptr, &seg);
 	}
 
+	// 重置ackcount
 	kcp->ackcount = 0;
 
 	// probe window size (if remote window size equals zero)
