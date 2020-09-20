@@ -298,6 +298,7 @@ struct IKCPCB
 	IUINT32 nrcv_que, nsnd_que;
 	IUINT32 nodelay, updated;
 	IUINT32 ts_probe, probe_wait;
+	// dead_link，最大传输次数，超出kcp会话断开
 	IUINT32 dead_link, incr;
 	struct IQUEUEHEAD snd_queue;
 	struct IQUEUEHEAD rcv_queue;

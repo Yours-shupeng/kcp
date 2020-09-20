@@ -681,8 +681,7 @@ static void ikcp_parse_fastack(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 			break;
 		}
 		else if (sn != seg->sn) {
-		    // 更新fastack次数
-		    // TODO，触发什么逻辑，后面再补充
+		    // 更新ACK被跳过的次数
 		#ifndef IKCP_FASTACK_CONSERVE
 			seg->fastack++;
 		#else
@@ -1074,6 +1073,7 @@ void ikcp_flush(ikcpcb *kcp)
 			ptr = buffer;
 		}
 		ikcp_ack_get(kcp, i, &seg.sn, &seg.ts);
+		// encode结束后，ptr指向分片协议头的最后位置，这些ACK只有头，没有数据
 		ptr = ikcp_encode_seg(ptr, &seg);
 	}
 
@@ -1081,28 +1081,38 @@ void ikcp_flush(ikcpcb *kcp)
 	kcp->ackcount = 0;
 
 	// probe window size (if remote window size equals zero)
+	// 如果接收端空闲窗口为0
 	if (kcp->rmt_wnd == 0) {
+	    // 首次探测
 		if (kcp->probe_wait == 0) {
+		    // 探测初始等待时长7s
 			kcp->probe_wait = IKCP_PROBE_INIT;
+			// 下次探测的时间戳
 			kcp->ts_probe = kcp->current + kcp->probe_wait;
 		}	
 		else {
+		    // 非首次探测，如果到达下次探测时间，准备继续发送探测消息，否则轮空
 			if (_itimediff(kcp->current, kcp->ts_probe) >= 0) {
 				if (kcp->probe_wait < IKCP_PROBE_INIT) 
 					kcp->probe_wait = IKCP_PROBE_INIT;
+				// 探测等待时间延长至1.5倍，最长等待120s
 				kcp->probe_wait += kcp->probe_wait / 2;
 				if (kcp->probe_wait > IKCP_PROBE_LIMIT)
 					kcp->probe_wait = IKCP_PROBE_LIMIT;
+				// 更新下次探测的时间戳
 				kcp->ts_probe = kcp->current + kcp->probe_wait;
+				// 准备继续发送探测
 				kcp->probe |= IKCP_ASK_SEND;
 			}
 		}
 	}	else {
+	    // 接收方空余窗口大小大于0，停止探测
 		kcp->ts_probe = 0;
 		kcp->probe_wait = 0;
 	}
 
 	// flush window probing commands
+	// 如果本次需要发送探测消息，发送CMD_WASK消息请求接收方空余窗口大小
 	if (kcp->probe & IKCP_ASK_SEND) {
 		seg.cmd = IKCP_CMD_WASK;
 		size = (int)(ptr - buffer);
@@ -1114,6 +1124,7 @@ void ikcp_flush(ikcpcb *kcp)
 	}
 
 	// flush window probing commands
+	// 如果本次需要回复CMD_WASK消息，发送CMD_WINS告知对方
 	if (kcp->probe & IKCP_ASK_TELL) {
 		seg.cmd = IKCP_CMD_WINS;
 		size = (int)(ptr - buffer);
@@ -1124,9 +1135,12 @@ void ikcp_flush(ikcpcb *kcp)
 		ptr = ikcp_encode_seg(ptr, &seg);
 	}
 
+	// 重置probe，下次如果需要探测，会再次设置标志位
 	kcp->probe = 0;
 
 	// calculate window size
+	// 计算新的窗口大小
+	// TODO cwnd, snd_wnd, rcv_wnd, rmt_wnd的关系
 	cwnd = _imin_(kcp->snd_wnd, kcp->rmt_wnd);
 	if (kcp->nocwnd == 0) cwnd = _imin_(kcp->cwnd, cwnd);
 
@@ -1143,22 +1157,28 @@ void ikcp_flush(ikcpcb *kcp)
 		kcp->nsnd_buf++;
 
 		newseg->conv = kcp->conv;
+		// 发送数据的指令CMD_PUSH
 		newseg->cmd = IKCP_CMD_PUSH;
 		newseg->wnd = seg.wnd;
 		newseg->ts = current;
+		// 更新sn(序列号)，一个kcp会话维护一个snd_nxt计数，不断自增
 		newseg->sn = kcp->snd_nxt++;
+		// 更新una（确认编号），一个kcp会话维护一个rcv_nxt计数
 		newseg->una = kcp->rcv_nxt;
 		newseg->resendts = current;
+		// 更新分片的rto为当前kcp会话的rto
 		newseg->rto = kcp->rx_rto;
 		newseg->fastack = 0;
 		newseg->xmit = 0;
 	}
 
 	// calculate resent
+	// 快重传，默认不开启，可以通过接口设置是否开启，一般设为2，即2次ACK跳过直接重传
 	resent = (kcp->fastresend > 0)? (IUINT32)kcp->fastresend : 0xffffffff;
 	rtomin = (kcp->nodelay == 0)? (kcp->rx_rto >> 3) : 0;
 
 	// flush data segments
+	// snd_buf -> network
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = p->next) {
 		IKCPSEG *segment = iqueue_entry(p, IKCPSEG, node);
 		int needsend = 0;
@@ -1166,28 +1186,36 @@ void ikcp_flush(ikcpcb *kcp)
 			needsend = 1;
 			segment->xmit++;
 			segment->rto = kcp->rx_rto;
+			// 下次重传时间：rto + rtomain
 			segment->resendts = current + segment->rto + rtomin;
 		}
 		else if (_itimediff(current, segment->resendts) >= 0) {
+		    // 达到重传时间,更新传输计数次数
 			needsend = 1;
 			segment->xmit++;
 			kcp->xmit++;
 			if (kcp->nodelay == 0) {
+			    // 未开启nodelay，累加之前的rto和最新的rot
 				segment->rto += _imax_(segment->rto, (IUINT32)kcp->rx_rto);
 			}	else {
+			    // 开启了nodelay，rot变为大约1.5倍（如果rx_rot == rto的话）
 				IINT32 step = (kcp->nodelay < 2)? 
 					((IINT32)(segment->rto)) : kcp->rx_rto;
 				segment->rto += step / 2;
 			}
+			// 更新下次重传时间
 			segment->resendts = current + segment->rto;
 			lost = 1;
 		}
 		else if (segment->fastack >= resent) {
+		    // 分片ACK跳过次数超过resent，直接重传
 			if ((int)segment->xmit <= kcp->fastlimit || 
 				kcp->fastlimit <= 0) {
 				needsend = 1;
 				segment->xmit++;
+				// 清除标记
 				segment->fastack = 0;
+				// rto和首次保持不变
 				segment->resendts = current + segment->rto;
 				change++;
 			}
@@ -1202,6 +1230,7 @@ void ikcp_flush(ikcpcb *kcp)
 			size = (int)(ptr - buffer);
 			need = IKCP_OVERHEAD + segment->len;
 
+			// 如果buff中原先有数据，并且加上改分片以后会大于mtu，则先发送buff中已经有的数据
 			if (size + need > (int)kcp->mtu) {
 				ikcp_output(kcp, buffer, size);
 				ptr = buffer;
@@ -1209,6 +1238,7 @@ void ikcp_flush(ikcpcb *kcp)
 
 			ptr = ikcp_encode_seg(ptr, segment);
 
+			// 数据segment中的数据拷贝到buffer
 			if (segment->len > 0) {
 				memcpy(ptr, segment->data, segment->len);
 				ptr += segment->len;
@@ -1221,6 +1251,7 @@ void ikcp_flush(ikcpcb *kcp)
 	}
 
 	// flash remain segments
+	// 发送完kcp buffer中剩余的数据
 	size = (int)(ptr - buffer);
 	if (size > 0) {
 		ikcp_output(kcp, buffer, size);
@@ -1228,15 +1259,19 @@ void ikcp_flush(ikcpcb *kcp)
 
 	// update ssthresh
 	if (change) {
+	    // 窗口中实际占用大小
 		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una;
+        // 更新门限阈值
 		kcp->ssthresh = inflight / 2;
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
 			kcp->ssthresh = IKCP_THRESH_MIN;
+		// 更新发送窗口大小
 		kcp->cwnd = kcp->ssthresh + resent;
 		kcp->incr = kcp->cwnd * kcp->mss;
 	}
 
 	if (lost) {
+	    // 如果丢包，阈值变为窗口一半大小，cwnd调整为1，重新开始慢启动
 		kcp->ssthresh = cwnd / 2;
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
 			kcp->ssthresh = IKCP_THRESH_MIN;
@@ -1244,6 +1279,7 @@ void ikcp_flush(ikcpcb *kcp)
 		kcp->incr = kcp->mss;
 	}
 
+	// 保证临界点
 	if (kcp->cwnd < 1) {
 		kcp->cwnd = 1;
 		kcp->incr = kcp->mss;
@@ -1254,8 +1290,14 @@ void ikcp_flush(ikcpcb *kcp)
 //---------------------------------------------------------------------
 // update state (call it repeatedly, every 10ms-100ms), or you can ask 
 // ikcp_check when to call it again (without ikcp_input/_send calling).
-// 'current' - current timestamp in millisec. 
+// 'current' - current timestamp in millisec.
 //---------------------------------------------------------------------
+/**
+ * 定时循环调用，flush数据
+ *
+ * @param kcp
+ * @param current， 单位ms
+ */
 void ikcp_update(ikcpcb *kcp, IUINT32 current)
 {
 	IINT32 slap;
@@ -1270,6 +1312,7 @@ void ikcp_update(ikcpcb *kcp, IUINT32 current)
 	slap = _itimediff(kcp->current, kcp->ts_flush);
 
 	if (slap >= 10000 || slap < -10000) {
+	    // 超时重置
 		kcp->ts_flush = kcp->current;
 		slap = 0;
 	}
@@ -1293,6 +1336,13 @@ void ikcp_update(ikcpcb *kcp, IUINT32 current)
 // schedule ikcp_update (eg. implementing an epoll-like mechanism, 
 // or optimize ikcp_update when handling massive kcp connections)
 //---------------------------------------------------------------------
+/**
+ * 检查ikcp_update下次调用的时间，避免轮询。但是，如果有数据要发送，还是要定期调用update
+ *
+ * @param kcp
+ * @param current
+ * @return
+ */
 IUINT32 ikcp_check(const ikcpcb *kcp, IUINT32 current)
 {
 	IUINT32 ts_flush = kcp->ts_flush;
@@ -1310,12 +1360,14 @@ IUINT32 ikcp_check(const ikcpcb *kcp, IUINT32 current)
 		ts_flush = current;
 	}
 
+	// 超过下次刷新时间，直接返回当前时间
 	if (_itimediff(current, ts_flush) >= 0) {
 		return current;
 	}
 
 	tm_flush = _itimediff(ts_flush, current);
 
+	// 计算最近一次需要发送数据包的时间
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = p->next) {
 		const IKCPSEG *seg = iqueue_entry(p, const IKCPSEG, node);
 		IINT32 diff = _itimediff(seg->resendts, current);
@@ -1332,12 +1384,19 @@ IUINT32 ikcp_check(const ikcpcb *kcp, IUINT32 current)
 }
 
 
-
+/**
+ * 设置最大传输单元
+ *
+ * @param kcp
+ * @param mtu
+ * @return
+ */
 int ikcp_setmtu(ikcpcb *kcp, int mtu)
 {
 	char *buffer;
 	if (mtu < 50 || mtu < (int)IKCP_OVERHEAD) 
 		return -1;
+	// buffer是写数据到network的最后一个缓存，mtu改变需要重新分配空间
 	buffer = (char*)ikcp_malloc((mtu + IKCP_OVERHEAD) * 3);
 	if (buffer == NULL) 
 		return -2;
@@ -1356,14 +1415,26 @@ int ikcp_interval(ikcpcb *kcp, int interval)
 	return 0;
 }
 
+/**
+ * NODELAY开关
+ *
+ * @param kcp
+ * @param nodelay 是否启用 nodelay模式，0不启用；1启用。
+ * @param interval 协议内部工作的 interval，单位毫秒，比如 10ms或者 20ms
+ * @param resend 快速重传模式，默认0关闭，可以设置2（2次ACK跨越将会直接重传）
+ * @param nc 是否关闭流控，默认是0代表不关闭，1代表关闭。
+ * @return
+ */
 int ikcp_nodelay(ikcpcb *kcp, int nodelay, int interval, int resend, int nc)
 {
 	if (nodelay >= 0) {
 		kcp->nodelay = nodelay;
 		if (nodelay) {
+		    // 30ms
 			kcp->rx_minrto = IKCP_RTO_NDL;	
 		}	
 		else {
+		    // 100ms
 			kcp->rx_minrto = IKCP_RTO_MIN;
 		}
 	}
@@ -1402,6 +1473,12 @@ int ikcp_waitsnd(const ikcpcb *kcp)
 
 
 // read conv
+/**
+ * 读取kcp会话编号
+ *
+ * @param ptr
+ * @return
+ */
 IUINT32 ikcp_getconv(const void *ptr)
 {
 	IUINT32 conv;
