@@ -267,17 +267,25 @@ typedef struct IQUEUEHEAD iqueue_head;
 struct IKCPSEG
 {
 	struct IQUEUEHEAD node;
+	// 会话编号
 	IUINT32 conv;
+	// PUSH、ACK、WASK、WINS几种命令之一
 	IUINT32 cmd;
+	// 分片编号，0-n，0是最后一个分片
 	IUINT32 frg;
+	// 空闲窗口大小
 	IUINT32 wnd;
 	IUINT32 ts;
+	// 每个分片对应的唯一编号
 	IUINT32 sn;
+	// 也是分片编号，表示una之前的编号都已经收到ACK
 	IUINT32 una;
 	IUINT32 len;
 	IUINT32 resendts;
 	IUINT32 rto;
+	// ACK被跳过次数
 	IUINT32 fastack;
+	// 传输次数
 	IUINT32 xmit;
 	char data[1];
 };
@@ -304,6 +312,7 @@ struct IKCPCB
 	struct IQUEUEHEAD rcv_queue;
 	struct IQUEUEHEAD snd_buf;
 	struct IQUEUEHEAD rcv_buf;
+	// 收到数据以后sn和ts加入acklist，直接发送ACK消息
 	IUINT32 *acklist;
 	IUINT32 ackcount;
 	IUINT32 ackblock;
